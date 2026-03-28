@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: lead-management
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: SHEET_ID
+        sync: false        # you fill this in Render dashboard
+      - key: SLACK_WEBHOOK
+        sync: false        # you fill this in Render dashboard
+      - key: GOOGLE_CREDENTIALS
+        sync: false        # paste contents of credentials.json here
