@@ -7,12 +7,11 @@ Test:   http://127.0.0.1:8000/docs
 Deploy: Render / Railway
 """
 
-import csv
 import json
 import os
 import requests
 import phonenumbers
-import gspread
+import gspread,logging
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -28,8 +27,8 @@ from google.oauth2.service_account import Credentials
 #  Render: set these in the Render dashboard → Environment
 # ──────────────────────────────────────────
 
-SHEET_ID      = os.getenv("SHEET_ID",      "Your_sheet_id_here")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "Your_slack_webhook_here")
+SHEET_ID      = os.getenv("SHEET_ID",      "your_sheet_id")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "your_slack_url")
 REPS_SHEET    = "Reps"
 
 # Google credentials
@@ -44,6 +43,11 @@ store = {
     "index": 0
 }
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+logger = logging.getLogger()
 
 # ──────────────────────────────────────────
 #  APP
@@ -74,7 +78,7 @@ class Lead(BaseModel):
 @app.on_event("startup")
 def startup():
     load_reps()
-    print(f"✅ Loaded {len(store['active_reps'])} active reps")
+    logger.info(f"Loaded {len(store['active_reps'])} active reps")
 
 
 # ──────────────────────────────────────────
@@ -134,7 +138,7 @@ def receive_lead(lead: Lead):
         "Name":   lead.Name.strip(),
         "Email":  valid_email,
         "Phone":  valid_phone,
-        "Client": lead.Client,
+        "Client": lead.Client.strip() 
     }
 
     # ── Step 3: Assign rep ──
@@ -144,7 +148,7 @@ def receive_lead(lead: Lead):
     try:
         append_to_sheet(clean_lead)
     except Exception as e:
-        print(f"⚠️  Sheets error: {e}")
+        logger.error(f"⚠️  Sheets error: {e}")
 
     # ── Step 5: Notify Slack ──
     try:
@@ -153,16 +157,14 @@ def receive_lead(lead: Lead):
             f"*Name:* {clean_lead['Name']}\n"
             f"*Email:* {clean_lead['Email']}\n"
             f"*Phone:* {clean_lead['Phone']}\n"
-            f"*Client:* {clean_lead['Client']}\n"
             f"*Assigned To:* {clean_lead['Assigned_to']}"
         )
     except Exception as e:
-        print(f"⚠️  Slack error: {e}")
+        logger.error(f"⚠️  Slack error: {e}")
 
     return {
         "status":      "received",
-        "assigned_to": clean_lead["Assigned_to"],
-        "client":      clean_lead["Client"]
+        "assigned_to": clean_lead["Assigned_to"]
     }
 
 
@@ -208,7 +210,7 @@ def load_reps():
         store["index"] = 0
 
     except Exception as e:
-        print(f"⚠️  Could not load reps: {e}")
+        logger.error(f"⚠️  Could not load reps: {e}")
 
 
 def is_phone_number_valid(phone_number_str, region="IN"):
@@ -253,10 +255,9 @@ def assign_rep(lead: dict, client_id: str) -> dict:
     # Each client gets its own round-robin index
     idx_key = f"index_{client_id}"
     index   = store.setdefault(idx_key, 0)
-
     rep = client_reps[index % len(client_reps)]
     store[idx_key] += 1
-
+    del lead["Client"] 
     lead["Assigned_to"]    = rep["Name"]
     lead["Status"]         = "New"
     lead["Follow-Up Date"] = date.today().isoformat()
