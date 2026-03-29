@@ -4,7 +4,7 @@ Receives leads via HTTP POST instead of CSV files.
 
 Local:  uvicorn main:app --reload
 Test:   http://127.0.0.1:8000/docs
-Deploy: Render / Railway (reads config from environment variables)
+Deploy: Render / Railway
 """
 
 import csv
@@ -23,18 +23,20 @@ from google.oauth2.service_account import Credentials
 
 
 # ──────────────────────────────────────────
-#  CONFIG — reads from environment variables
-#  Set these in Render/Railway dashboard
-#  For local, they fall back to your original values
+#  CONFIG
+#  Local:  values read from environment or fall back to defaults
+#  Render: set these in the Render dashboard → Environment
 # ──────────────────────────────────────────
 
-SHEET_ID      = os.getenv("SHEET_ID",      "1SVCTqraL8aKz71PsB43_X2TG7Xo1BKpIkfLO0aJjOpQ")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "https://hooks.slack.com/services/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")
-REPS_FILE     = os.getenv("REPS_FILE",     "rep_data.csv")
+SHEET_ID      = os.getenv("SHEET_ID",      "Your_sheet_id_here")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "Your_slack_webhook_here")
+REPS_SHEET    = "Reps"
 
-# Google credentials — file path (local) or JSON string (Render/Railway)
+# Google credentials
+# Local  → reads from credentials.json file
+# Render → reads from GOOGLE_CREDENTIALS environment variable (paste JSON contents)
 GOOGLE_CREDENTIALS_PATH = Path.cwd() / "configs/credentials.json"
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # set in Render dashboard
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 
 # Shared state — loaded once when server starts
 store = {
@@ -59,24 +61,20 @@ app = FastAPI(
 # ──────────────────────────────────────────
 
 class Lead(BaseModel):
-    Name:  str
-    Email: str
-    Phone: str
+    Name:   str
+    Email:  str
+    Phone:  str
+    Client: str = "default"
 
 
 # ──────────────────────────────────────────
-#  STARTUP — runs once when server starts
+#  STARTUP — load reps once when server starts
 # ──────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
-    try:
-        reps = load_reps(REPS_FILE)
-        store["active_reps"] = [r for r in reps if r["Active"] == "Yes"]
-        store["index"] = 0
-        print(f"✅ Loaded {len(store['active_reps'])} active reps")
-    except FileNotFoundError:
-        print(f"⚠️  {REPS_FILE} not found — add reps before processing leads")
+    load_reps()
+    print(f"✅ Loaded {len(store['active_reps'])} active reps")
 
 
 # ──────────────────────────────────────────
@@ -85,10 +83,7 @@ def startup():
 
 @app.get("/")
 def health_check():
-    """
-    Used by UptimeRobot / Make to keep server awake.
-    Also confirms deployment is working.
-    """
+    """Used by UptimeRobot to keep server awake."""
     return {
         "status":  "running",
         "message": "Lead Management API is live",
@@ -96,17 +91,30 @@ def health_check():
     }
 
 
+@app.post("/reload-reps")
+def reload_reps():
+    """
+    Call this after editing the Reps sheet in Google Sheets.
+    POST https://your-app.onrender.com/reload-reps
+    """
+    load_reps()
+    return {
+        "status": "reloaded",
+        "reps":   len(store["active_reps"])
+    }
+
+
 @app.post("/leads")
 def receive_lead(lead: Lead):
     """
-    Main webhook endpoint.
-    Make / n8n / any form posts here.
+    Main webhook endpoint. Make / n8n posts here.
 
     Expected body:
     {
-        "Name":  "John Doe",
-        "Email": "john@example.com",
-        "Phone": "+919876543210"
+        "Name":   "John Doe",
+        "Email":  "john@example.com",
+        "Phone":  "+919876543210",
+        "Client": "client_a"
     }
     """
 
@@ -116,22 +124,21 @@ def receive_lead(lead: Lead):
 
     if not lead.Name.strip():
         raise HTTPException(status_code=422, detail="Name is required")
-
     if not valid_email:
         raise HTTPException(status_code=422, detail=f"Invalid email: {lead.Email}")
-
     if not valid_phone:
         raise HTTPException(status_code=422, detail=f"Invalid phone: {lead.Phone}")
 
     # ── Step 2: Build clean lead ──
     clean_lead = {
-        "Name":  lead.Name.strip(),
-        "Email": valid_email,
-        "Phone": valid_phone,
+        "Name":   lead.Name.strip(),
+        "Email":  valid_email,
+        "Phone":  valid_phone,
+        "Client": lead.Client,
     }
 
     # ── Step 3: Assign rep ──
-    clean_lead = assign_rep(clean_lead)
+    clean_lead = assign_rep(clean_lead, lead.Client)
 
     # ── Step 4: Save to Google Sheets ──
     try:
@@ -146,6 +153,7 @@ def receive_lead(lead: Lead):
             f"*Name:* {clean_lead['Name']}\n"
             f"*Email:* {clean_lead['Email']}\n"
             f"*Phone:* {clean_lead['Phone']}\n"
+            f"*Client:* {clean_lead['Client']}\n"
             f"*Assigned To:* {clean_lead['Assigned_to']}"
         )
     except Exception as e:
@@ -153,21 +161,54 @@ def receive_lead(lead: Lead):
 
     return {
         "status":      "received",
-        "assigned_to": clean_lead["Assigned_to"]
+        "assigned_to": clean_lead["Assigned_to"],
+        "client":      clean_lead["Client"]
     }
+
+
+# ──────────────────────────────────────────
+#  GOOGLE SHEETS CLIENT
+#  This is what was missing — used by both
+#  load_reps() and append_to_sheet()
+# ──────────────────────────────────────────
+
+def get_gspread_client():
+    """
+    Returns a gspread client.
+    Local  → reads from configs/credentials.json
+    Render → reads from GOOGLE_CREDENTIALS env variable
+    """
+    if GOOGLE_CREDENTIALS_JSON:
+        # Render: credentials stored as environment variable
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(creds)
+    else:
+        # Local: reads from file
+        return gspread.service_account(filename=GOOGLE_CREDENTIALS_PATH)
 
 
 # ──────────────────────────────────────────
 #  CORE FUNCTIONS
 # ──────────────────────────────────────────
 
-def load_reps(filename):
-    data = []
-    with open(filename, mode="r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            data.append(row)
-    return data
+def load_reps():
+    """Loads reps from the Reps tab in Google Sheets."""
+    try:
+        gc    = get_gspread_client()          # ← uses get_gspread_client()
+        sh    = gc.open_by_key(SHEET_ID)
+        sheet = sh.worksheet(REPS_SHEET)
+        reps  = sheet.get_all_records()
+
+        store["active_reps"] = [r for r in reps if str(r["Active"]).strip() == "Yes"]
+        store["index"] = 0
+
+    except Exception as e:
+        print(f"⚠️  Could not load reps: {e}")
 
 
 def is_phone_number_valid(phone_number_str, region="IN"):
@@ -193,16 +234,28 @@ def is_valid_email_advanced(email):
         return False
 
 
-def assign_rep(lead: dict) -> dict:
-    """Round-robin assignment using shared store."""
-    reps  = store["active_reps"]
-    index = store["index"]
+def assign_rep(lead: dict, client_id: str) -> dict:
+    """Round-robin assignment filtered by client."""
 
-    if not reps:
+    # Get reps for this specific client
+    client_reps = [
+        r for r in store["active_reps"]
+        if str(r.get("Client", "default")).strip() == client_id
+    ]
+
+    # Fall back to all active reps if none assigned to this client
+    if not client_reps:
+        client_reps = store["active_reps"]
+
+    if not client_reps:
         raise HTTPException(status_code=500, detail="No active reps available")
 
-    rep = reps[index % len(reps)]
-    store["index"] += 1
+    # Each client gets its own round-robin index
+    idx_key = f"index_{client_id}"
+    index   = store.setdefault(idx_key, 0)
+
+    rep = client_reps[index % len(client_reps)]
+    store[idx_key] += 1
 
     lead["Assigned_to"]    = rep["Name"]
     lead["Status"]         = "New"
@@ -210,29 +263,9 @@ def assign_rep(lead: dict) -> dict:
     return lead
 
 
-def get_gspread_client():
-    """
-    Returns a gspread client.
-    Local  → reads credentials from configs/credentials.json file
-    Render → reads credentials from GOOGLE_CREDENTIALS env variable
-    """
-    if GOOGLE_CREDENTIALS_JSON:
-        # Render/Railway: credentials stored as env variable (JSON string)
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        scopes = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(creds)
-    else:
-        # Local: reads from file
-        return gspread.service_account(filename=GOOGLE_CREDENTIALS_PATH)
-
-
 def append_to_sheet(lead: dict):
     """Appends one lead row to Google Sheets."""
-    gc    = get_gspread_client()
+    gc    = get_gspread_client()              # ← uses get_gspread_client()
     sh    = gc.open_by_key(SHEET_ID)
     sheet = sh.sheet1
 
