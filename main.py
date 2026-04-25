@@ -27,8 +27,8 @@ from google.oauth2.service_account import Credentials
 #  Render: set these in the Render dashboard → Environment
 # ──────────────────────────────────────────
 
-SHEET_ID      = os.getenv("SHEET_ID",      "your_sheet_id")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "your_slack_url")
+SHEET_ID      = os.getenv("SHEET_ID",      "1SVCTqraL8aKz71PsB43_X2TG7Xo1BKpIkfLO0aJjOpQ")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "https://hooks.slack.com/services/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")
 REPS_SHEET    = "Reps"
 
 # Google credentials
@@ -125,14 +125,18 @@ def receive_lead(lead: Lead):
     # ── Step 1: Validate ──
     valid_phone = is_phone_number_valid(lead.Phone)
     valid_email = is_valid_email_advanced(lead.Email)
-
-    if not lead.Name.strip():
-        raise HTTPException(status_code=422, detail="Name is required")
-    if not valid_email:
-        raise HTTPException(status_code=422, detail=f"Invalid email: {lead.Email}")
-    if not valid_phone:
-        raise HTTPException(status_code=422, detail=f"Invalid phone: {lead.Phone}")
-
+    try:
+        if not lead.Name.strip():
+            raise Exception("Name is required")
+        if not valid_email:
+            raise Exception(f"Invalid email: {lead.Email}")
+        if not valid_phone:
+            raise Exception(f"Invalid phone: {lead.Phone}")
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
     # ── Step 2: Build clean lead ──
     clean_lead = {
         "Name":   lead.Name.strip(),
@@ -163,8 +167,11 @@ def receive_lead(lead: Lead):
         logger.error(f"⚠️  Slack error: {e}")
 
     return {
-        "status":      "received",
-        "assigned_to": clean_lead["Assigned_to"]
+        "status":"received",
+        "Name": f"{clean_lead['Name']}",
+        "Email":f"{clean_lead['Email']}",
+        "Phone": f"{clean_lead['Phone']}",
+        "assigned_to": f"{clean_lead['Assigned_to']}"
     }
 
 
