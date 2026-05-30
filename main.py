@@ -21,23 +21,16 @@ from datetime import date
 from google.oauth2.service_account import Credentials
 
 
-# ──────────────────────────────────────────
-#  CONFIG
-#  Local:  values read from environment or fall back to defaults
-#  Render: set these in the Render dashboard → Environment
-# ──────────────────────────────────────────
-
 SHEET_ID      = os.getenv("SHEET_ID",      "1SVCTqraL8aKz71PsB43_X2TG7Xo1BKpIkfLO0aJjOpQ")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "https://hooks.slack.com/services/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")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "https://hooks.slack.com/services/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")
 REPS_SHEET    = "Reps"
 
 # Google credentials
 # Local  → reads from credentials.json file
 # Render → reads from GOOGLE_CREDENTIALS environment variable (paste JSON contents)
-GOOGLE_CREDENTIALS_PATH = Path.cwd() / "configs/credentials.json"
+GOOGLE_CREDENTIALS_PATH =Path(r" C:/Python_projects/configs/credentials.json")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 
-# Shared state — loaded once when server starts
 store = {
     "active_reps": [],
     "index": 0
@@ -49,10 +42,6 @@ logging.basicConfig(
     )
 logger = logging.getLogger()
 
-# ──────────────────────────────────────────
-#  APP
-# ──────────────────────────────────────────
-
 app = FastAPI(
     title="Lead Management API",
     description="Receives leads via webhook instead of CSV",
@@ -60,30 +49,16 @@ app = FastAPI(
 )
 
 
-# ──────────────────────────────────────────
-#  REQUEST MODEL
-# ──────────────────────────────────────────
-
 class Lead(BaseModel):
     Name:   str
     Email:  str
     Phone:  str
     Client: str = "default"
 
-
-# ──────────────────────────────────────────
-#  STARTUP — load reps once when server starts
-# ──────────────────────────────────────────
-
 @app.on_event("startup")
 def startup():
     load_reps()
     logger.info(f"Loaded {len(store['active_reps'])} active reps")
-
-
-# ──────────────────────────────────────────
-#  ROUTES
-# ──────────────────────────────────────────
 
 @app.get("/")
 def health_check():
@@ -122,7 +97,6 @@ def receive_lead(lead: Lead):
     }
     """
 
-    # ── Step 1: Validate ──
     valid_phone = is_phone_number_valid(lead.Phone)
     valid_email = is_valid_email_advanced(lead.Email)
     try:
@@ -133,28 +107,25 @@ def receive_lead(lead: Lead):
         if not valid_phone:
             raise Exception(f"Invalid phone: {lead.Phone}")
     except Exception as e:
+        logger.error(f"⚠️  Validation error: {e}")
         return {
             "status": "error",
             "message": str(e)
         }
-    # ── Step 2: Build clean lead ──
     clean_lead = {
         "Name":   lead.Name.strip(),
         "Email":  valid_email,
         "Phone":  valid_phone,
         "Client": lead.Client.strip() 
     }
-
-    # ── Step 3: Assign rep ──
     clean_lead = assign_rep(clean_lead, lead.Client)
 
-    # ── Step 4: Save to Google Sheets ──
     try:
         append_to_sheet(clean_lead)
+        logger.info(f"Lead saved for {clean_lead['Name']} assigned to {clean_lead['Assigned_to']}")
     except Exception as e:
         logger.error(f"⚠️  Sheets error: {e}")
 
-    # ── Step 5: Notify Slack ──
     try:
         send_slack(
             f"🆕 *New Lead Assigned*\n"
@@ -163,6 +134,7 @@ def receive_lead(lead: Lead):
             f"*Phone:* {clean_lead['Phone']}\n"
             f"*Assigned To:* {clean_lead['Assigned_to']}"
         )
+        logger.info(f"Slack notification sent for {clean_lead['Name']}")
     except Exception as e:
         logger.error(f"⚠️  Slack error: {e}")
 
@@ -173,13 +145,6 @@ def receive_lead(lead: Lead):
         "Phone": f"{clean_lead['Phone']}",
         "assigned_to": f"{clean_lead['Assigned_to']}"
     }
-
-
-# ──────────────────────────────────────────
-#  GOOGLE SHEETS CLIENT
-#  This is what was missing — used by both
-#  load_reps() and append_to_sheet()
-# ──────────────────────────────────────────
 
 def get_gspread_client():
     """
@@ -200,10 +165,6 @@ def get_gspread_client():
         # Local: reads from file
         return gspread.service_account(filename=GOOGLE_CREDENTIALS_PATH)
 
-
-# ──────────────────────────────────────────
-#  CORE FUNCTIONS
-# ──────────────────────────────────────────
 
 def load_reps():
     """Loads reps from the Reps tab in Google Sheets."""
